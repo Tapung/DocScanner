@@ -21,3 +21,6 @@ some example text document provided in the texts_document folder.
 email: talenlio@gmail.com
 password: Talenlio@123
 
+
+deployed link : https://docscanner-l7kk.onrender.com/
+
