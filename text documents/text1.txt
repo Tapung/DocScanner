@@ -1,0 +1,277 @@
+these are my model:
+import mongoose from "mongoose";
+const adminSchema = new mongoose.Schema({
+    email: { type: String, required: true },
+    username: { type: String, required: true, unique: true },
+    password: { type: String, required: true },
+    role: { type: String, enum: ["admin"], default: "admin" } // Default role is "admin"
+}, { timestamps: true });
+
+const Admin = mongoose.model("Admin", adminSchema);
+
+export default Admin;
+
+
+import mongoose from "mongoose";
+
+const documentSchema = new mongoose.Schema({
+    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }, // User who uploaded
+    filename: { type: String, required: true }, // Original filename
+    fileType: { type: String, enum: ['pdf', 'jpeg', 'png', 'jpg'], required: true }, // Allowed types
+    uploadedAt: { type: Date, default: Date.now }, // Upload timestamp
+
+    // Store images as Buffers, PDFs will be handled by GridFS
+    fileData: { 
+        type: Buffer, 
+        required: function() { return this.fileType !== 'pdf'; } 
+    },
+
+    gridFSId: { type: mongoose.Schema.Types.ObjectId, default: null }, // Store reference for PDFs in GridFS
+});
+
+const Document = mongoose.model('Document', documentSchema);
+export default Document;
+import mongoose from "mongoose";
+
+const userSchema = new mongoose.Schema({
+    username: { type: String, required: true, unique: true },
+    email: { type: String, required: true, unique: true },
+    password: { type: String, required: true }, // Store hashed password
+    role: { type: String, enum: ["user", "admin"], default: "user" }, // Default role is "user"
+    credits: { type: Number, default: 20 }, // Starts with 20 credits
+    lastReset: { type: Date, default: new Date() }, // Tracks last credit reset
+
+    creditRequests: [{
+        amount: { type: Number, required: true },
+        status: { type: String, enum: ['pending', 'approved', 'denied'], default: 'pending' },
+        requestedAt: { type: Date, default: Date.now },
+        reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin', default: null },
+    }],
+}, { timestamps: true });
+
+// Function to reset credits at midnight (server time)
+userSchema.methods.resetCredits = function () {
+    const now = new Date();
+    if (now.toDateString() !== this.lastReset.toDateString()) {
+        this.credits = 20; // Reset credits
+        this.lastReset = now;
+    }
+};
+
+const User = mongoose.model('User', userSchema);
+export default User;
+
+this is my controller for document:
+import mongoose from "mongoose";
+import Document from "../models/Doc_model.js";
+import User from "../models/User_model.js";
+import multer from "multer";
+import { GridFsStorage } from "multer-gridfs-storage";
+import Grid from "gridfs-stream";
+import pdfParse from "pdf-parse";
+import Tesseract from "tesseract.js";
+import levenshtein from "fast-levenshtein";
+import dotenv from "dotenv";
+
+dotenv.config();
+
+// MongoDB Connection
+const conn = mongoose.connection;
+let gfs;
+
+conn.once("open", () => {
+    gfs = Grid(conn.db, mongoose.mongo);
+    gfs.collection("uploads");
+});
+
+// Multer Storage (For PDFs, Uses GridFS)
+const storage = new GridFsStorage({
+    url: process.env.MONGO_URI,
+    file: (req, file) => {
+        return new Promise((resolve, reject) => {
+            if (file.mimetype === "application/pdf") {
+                resolve({ filename: file.originalname, bucketName: "uploads" });
+            } else {
+                reject(new Error("Only PDF is allowed in GridFS"));
+            }
+        });
+    }
+});
+
+const upload = multer({ storage });
+
+// Multer Memory Storage (For Images)
+const imageUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 5 * 1024 * 1024 }, // 5MB Max
+});
+
+// 📌 Upload Document (Only Admins Can Upload)
+export const uploadDocument = async (req, res) => {
+    try {
+        const { userId } = req.body;
+        const admin = await User.findById(userId);
+
+        if (!admin || admin.role !== "admin") {
+            return res.status(403).json({ message: "Access Denied! Only Admins Can Upload" });
+        }
+
+        let newDocument;
+
+        if (req.file.mimetype === "application/pdf") {
+            // PDF Handling (Stored in GridFS)
+            newDocument = new Document({
+                user: userId,
+                filename: req.file.originalname,
+                fileType: "pdf",
+                gridFSId: req.file.id,
+            });
+
+        } else {
+            // Image Handling (Stored as Buffer)
+            newDocument = new Document({
+                user: userId,
+                filename: req.file.originalname,
+                fileType: req.file.mimetype.split("/")[1],
+                fileData: req.file.buffer,
+            });
+        }
+
+        await newDocument.save();
+        res.status(201).json({ message: "File uploaded successfully", document: newDocument });
+
+    } catch (error) {
+        res.status(500).json({ message: "Error uploading document", error: error.message });
+    }
+};
+
+const extractTextFromPDF = async (gridFSId) => {
+    return new Promise((resolve, reject) => {
+        const fileStream = gfs.createReadStream({ _id: gridFSId });
+
+        let dataBuffer = "";
+        fileStream.on("data", (chunk) => (dataBuffer += chunk));
+        fileStream.on("end", async () => {
+            const parsedData = await pdfParse(dataBuffer);
+            resolve(parsedData.text);
+        });
+        fileStream.on("error", (error) => reject(error));
+    });
+};
+// 📌 Extract Text from Image (OCR)
+const extractTextFromImage = async (imageBuffer) => {
+    return await Tesseract.recognize(imageBuffer, "eng").then(({ data: { text } }) => text);
+};
+
+// 📌 Scan Document (Users Only, Deducts Credits)
+export const scanDocument = async (req, res) => {
+    try {
+        const { userId, docId } = req.body;
+        const user = await User.findById(userId);
+
+        if (!user) return res.status(404).json({ message: "User not found" });
+        if (user.role !== "user") return res.status(403).json({ message: "Only Users Can Scan Documents" });
+
+        // Check if the user has credits
+        if (user.credits <= 0) {
+            return res.status(403).json({ message: "Insufficient Credits. Please Request More." });
+        }
+
+        const document = await Document.findById(docId);
+        if (!document) return res.status(404).json({ message: "Document not found" });
+
+        let extractedText;
+
+        if (document.fileType === "pdf") {
+            extractedText = await extractTextFromPDF(document.gridFSId);
+        } else {
+            extractedText = await extractTextFromImage(document.fileData);
+        }
+
+        // Deduct 1 credit from user
+        user.credits -= 1;
+        await user.save();
+
+        res.json({ message: "Scan Successful", extractedText });
+
+    } catch (error) {
+        res.status(500).json({ message: "Error scanning document", error: error.message });
+    }
+};
+
+// 📌 Match Documents (Users Only, Deducts Credits)
+export const matchDocuments = async (req, res) => {
+    try {
+        const { userId, docId1, docId2 } = req.body;
+        const user = await User.findById(userId);
+
+        if (!user) return res.status(404).json({ message: "User not found" });
+        if (user.role !== "user") return res.status(403).json({ message: "Only Users Can Match Documents" });
+
+        // Check if the user has credits
+        if (user.credits <= 0) {
+            return res.status(403).json({ message: "Insufficient Credits. Please Request More." });
+        }
+
+        const doc1 = await Document.findById(docId1);
+        const doc2 = await Document.findById(docId2);
+
+        if (!doc1 || !doc2) {
+            return res.status(404).json({ message: "One or both documents not found" });
+        }
+
+        let text1, text2;
+
+        if (doc1.fileType === "pdf") {
+            text1 = await extractTextFromPDF(doc1.gridFSId);
+        } else {
+            text1 = await extractTextFromImage(doc1.fileData);
+        }
+
+        if (doc2.fileType === "pdf") {
+            text2 = await extractTextFromPDF(doc2.gridFSId);
+        } else {
+            text2 = await extractTextFromImage(doc2.fileData);
+        }
+
+        // Calculate similarity using Levenshtein distance
+        const distance = levenshtein.get(text1, text2);
+        const similarity = ((Math.max(text1.length, text2.length) - distance) / Math.max(text1.length, text2.length)) * 100;
+
+        // Deduct 1 credit from user
+        user.credits -= 1;
+        await user.save();
+
+        res.json({ similarity: similarity.toFixed(2) + "%" });
+
+    } catch (error) {
+        res.status(500).json({ message: "Error matching documents", error: error.message });
+    }
+};
+
+// 📌 Delete Document (Admin Only)
+export const deleteDocument = async (req, res) => {
+    try {
+        const { docId } = req.params;
+        const userRole = req.user.role; // Extracted from middleware
+
+        if (userRole !== "admin") {
+            return res.status(403).json({ message: "Access Denied! Admin Only" });
+        }
+
+        const doc = await Document.findById(docId);
+        if (!doc) return res.status(404).json({ message: "Document not found" });
+
+        // If it's a PDF, remove from GridFS
+        if (doc.fileType === "pdf" && doc.gridFSId) {
+            await gfs.remove({ _id: doc.gridFSId, root: "uploads" });
+        }
+
+        await Document.findByIdAndDelete(docId);
+        res.json({ message: "Document deleted successfully" });
+
+    } catch (error) {
+        res.status(500).json({ message: "Error deleting document", error: error.message });
+    }
+};
+
