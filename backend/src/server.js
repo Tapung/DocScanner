@@ -8,6 +8,8 @@ import cookieParser from "cookie-parser";
 import docRoutes from "./routes/documentRoutes.js"
 import creditRoutes from "./routes/creditRoutes.js"
 import adminRoutes from "./routes/adminRoutes.js";
+import path from "path";
+import { fileURLToPath } from "url";
 
 
 dotenv.config();
@@ -22,10 +24,13 @@ app.use(cookieParser());
  
 
 app.use("/auth", userRouter); 
-app.use("/auth",login_user_admin)
-app.use("/doc",docRoutes)
-app.use("/credits", creditRoutes)
+app.use("/auth",login_user_admin);
+app.use("/doc",docRoutes);
+app.use("/credits", creditRoutes);
 app.use("/admin", adminRoutes);
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 app.use(express.static(path.join(__dirname, "build")));
 
@@ -33,7 +38,6 @@ app.use(express.static(path.join(__dirname, "build")));
 app.get("*", (req, res) => {
   res.sendFile(path.join(__dirname, "build", "index.html"));
 });
-
 
 const PORT = process.env.PORT || 8000;
 
