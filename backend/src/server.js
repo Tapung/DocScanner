@@ -27,9 +27,12 @@ app.use("/doc",docRoutes)
 app.use("/credits", creditRoutes)
 app.use("/admin", adminRoutes);
 
-app.get("/", (req, res)=>{
-    res.send("hello")
-})
+app.use(express.static(path.join(__dirname, "build")));
+
+// Serve React app for all unknown routes
+app.get("*", (req, res) => {
+  res.sendFile(path.join(__dirname, "build", "index.html"));
+});
 
 
 const PORT = process.env.PORT || 8000;
